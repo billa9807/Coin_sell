@@ -22,8 +22,17 @@ logger = logging.getLogger(__name__)
 # Config
 # ─────────────────────────────────────────────
 
-BOT_TOKEN: str    = os.environ["TELEGRAM_BOT_TOKEN"]
-DATABASE_URL: str = os.environ["DATABASE_URL"]
+def _require_env(key: str) -> str:
+    val = os.environ.get(key)
+    if not val:
+        raise SystemExit(
+            f"\n[ERROR] Environment variable '{key}' is not set.\n"
+            f"Railway dashboard → Variables → Add '{key}' and redeploy.\n"
+        )
+    return val
+
+BOT_TOKEN: str    = _require_env("TELEGRAM_BOT_TOKEN")
+DATABASE_URL: str = _require_env("DATABASE_URL")
 DHAKA_TZ          = ZoneInfo("Asia/Dhaka")
 
 COIN_TYPES = ["NS", "NIVA", "TOP"]
