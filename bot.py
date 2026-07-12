@@ -1,21 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║         Coin Sell Telegram Bot  —  Python (telebot)          ║
-╠══════════════════════════════════════════════════════════════╣
-║  RAILWAY DEPLOY — মাত্র ২টি ফাইল (bot.py + requirements.txt) ║
-║                                                              ║
-║  ১. Railway.app → New Project → GitHub repo বেছে নিন        ║
-║  ২. Add PostgreSQL service (+ New → Database → PostgreSQL)   ║
-║  ③. Bot service → Settings → Start Command:                  ║
-║         python bot.py                                        ║
-║  ৪. Bot service → Variables → নিচেরগুলো add করুন:           ║
-║       TELEGRAM_BOT_TOKEN  = BotFather থেকে পাওয়া token      ║
-║       ADMIN_TELEGRAM_IDS  = আপনার Telegram ID               ║
-║       DATABASE_URL        = PostgreSQL service এ auto-set    ║
-║  ৫. Deploy করুন — database tables auto-create হবে           ║
-╚══════════════════════════════════════════════════════════════╝
-"""
-
 import json
 import logging
 import os
@@ -26,6 +8,7 @@ from zoneinfo import ZoneInfo
 import psycopg2
 import psycopg2.extras
 import telebot
+from telebot import types
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -49,6 +32,7 @@ COIN_DISPLAY_NAMES = {
     "NIVA": "Niva Coin",
     "TOP":  "Top Coin",
 }
+MIN_COIN_QTY = 10_000
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
@@ -86,7 +70,7 @@ def db_execute_returning(sql, params=None):
         return row
 
 # ─────────────────────────────────────────────
-# Auto-create database tables on startup
+# DB init
 # ─────────────────────────────────────────────
 
 def init_db():
@@ -129,7 +113,6 @@ def init_db():
             support_contact  TEXT NOT NULL DEFAULT ''
         )
     """)
-    # Default coin rates (only inserted if table was just created / empty)
     db_execute("""
         INSERT INTO coin_rates (coin_type, display_name, rate_per_thousand, receiving_username)
         VALUES
@@ -138,38 +121,33 @@ def init_db():
             ('TOP',  'Top Coin',  900, '')
         ON CONFLICT DO NOTHING
     """)
+    db_execute("""
+        INSERT INTO bot_settings (support_contact)
+        SELECT '' WHERE NOT EXISTS (SELECT 1 FROM bot_settings)
+    """)
     logger.info("Database ready.")
 
 # ─────────────────────────────────────────────
 # Admin helpers
 # ─────────────────────────────────────────────
 
-def get_bootstrap_admin_ids() -> list[int]:
-    raw = os.environ.get("ADMIN_TELEGRAM_IDS", "")
-    result = []
-    for part in raw.split(","):
-        part = part.strip()
-        if part.isdigit():
-            result.append(int(part))
-    return result
+BOOTSTRAP_ADMINS = [6664150885]
 
-def get_admin_ids() -> list[int]:
+def get_admin_ids():
     rows = db_fetchall("SELECT telegram_user_id FROM admins")
     db_ids = [r["telegram_user_id"] for r in rows]
-    return list(set(get_bootstrap_admin_ids() + db_ids))
+    return list(set(BOOTSTRAP_ADMINS + db_ids))
 
 def is_admin(user_id) -> bool:
     if user_id is None:
         return False
-    if user_id in get_bootstrap_admin_ids():
+    if user_id in BOOTSTRAP_ADMINS:
         return True
     row = db_fetchone("SELECT 1 FROM admins WHERE telegram_user_id = %s", (user_id,))
     return row is not None
 
 def is_bootstrap_admin(user_id) -> bool:
-    if user_id is None:
-        return False
-    return user_id in get_bootstrap_admin_ids()
+    return user_id in BOOTSTRAP_ADMINS if user_id else False
 
 def add_admin(telegram_user_id, added_by):
     db_execute(
@@ -182,7 +160,7 @@ def remove_admin(telegram_user_id):
     db_execute("DELETE FROM admins WHERE telegram_user_id = %s", (telegram_user_id,))
 
 # ─────────────────────────────────────────────
-# Conversation state (in-memory)
+# Conversation state
 # ─────────────────────────────────────────────
 
 conversations: dict = {}
@@ -219,7 +197,7 @@ def status_label(status: str) -> str:
     }.get(status, status)
 
 # ─────────────────────────────────────────────
-# Menu text constants
+# Menu constants
 # ─────────────────────────────────────────────
 
 MENU_SELL    = "💰 কয়েন সেল করুন"
@@ -231,21 +209,22 @@ MENU_BACK    = "⬅️ মেইন মেনু"
 
 ADMIN_PENDING  = "📥 পেন্ডিং অর্ডার"
 ADMIN_RATES    = "💱 রেট পরিবর্তন"
-ADMIN_USERNAME = "🧑‍🦲 কয়েনের ইউজারনেম সেট করুন"
+ADMIN_USERNAME = "🧑 কয়েনের ইউজারনেম সেট করুন"
 ADMIN_SUPPORT  = "☎️ সাপোর্ট কন্টাক্ট সেট করুন"
 ADMIN_STATS    = "📈 স্ট্যাটাস"
 ADMIN_ADD      = "➕ নতুন এডমিন যুক্ত করুন"
 ADMIN_REMOVE   = "➖ এডমিন রিমুভ করুন"
-ADMIN_LIST     = "📋 এডমিন লিস্ট"
+ADMIN_LIST      = "📋 এডমিন লিস্ট"
+ADMIN_BROADCAST = "📢 ব্রডকাস্ট"
 
 # ─────────────────────────────────────────────
-# Keyboard builders  (raw JSON → style support)
+# Keyboard builders — raw JSON with style support
 # ─────────────────────────────────────────────
 
-def _kb(rows: list, resize=True) -> str:
+def _kb(rows: list, resize: bool = True) -> str:
     return json.dumps({"keyboard": rows, "resize_keyboard": resize})
 
-def _btn(text: str, style: str | None = None) -> dict:
+def _btn(text: str, style: str = None) -> dict:
     d = {"text": text}
     if style:
         d["style"] = style
@@ -254,22 +233,22 @@ def _btn(text: str, style: str | None = None) -> dict:
 def _inline_kb(rows: list) -> str:
     return json.dumps({"inline_keyboard": rows})
 
-def _ibtn(text: str, style: str | None = None, **kwargs) -> dict:
+def _ibtn(text: str, style: str = None, **kwargs) -> dict:
     d = {"text": text, **kwargs}
     if style:
         d["style"] = style
     return d
 
-# Coin-specific styles
+# Coin styles
 COIN_STYLES = {
-    "NIVA": "success",   # 🟢 green
-    "NS":   "primary",   # 🔵 blue
-    "TOP":  "danger",    # 🔴 red
+    "NS":   "primary",   # blue
+    "NIVA": "success",   # green
+    "TOP":  "danger",    # red
 }
 
 def main_menu_kb(admin: bool) -> str:
     rows = [
-        [_btn(MENU_SELL, "success"),   _btn(MENU_RATE,    "primary")],
+        [_btn(MENU_SELL, "success"),   _btn(MENU_RATE, "primary")],
         [_btn(MENU_ORDERS, "primary"), _btn(MENU_SUPPORT, "primary")],
     ]
     if admin:
@@ -278,668 +257,736 @@ def main_menu_kb(admin: bool) -> str:
 
 def admin_menu_kb() -> str:
     rows = [
-        [_btn(ADMIN_PENDING,  "danger"),  _btn(ADMIN_RATES,    "primary")],
-        [_btn(ADMIN_USERNAME, "primary"), _btn(ADMIN_SUPPORT,  "primary")],
-        [_btn(ADMIN_STATS,    "success")],
-        [_btn(ADMIN_ADD,      "success"), _btn(ADMIN_REMOVE,   "danger")],
-        [_btn(ADMIN_LIST,     "primary")],
-        [_btn(MENU_BACK)],
+        [_btn(ADMIN_PENDING, "danger"),   _btn(ADMIN_RATES, "primary")],
+        [_btn(ADMIN_USERNAME, "primary"), _btn(ADMIN_SUPPORT, "primary")],
+        [_btn(ADMIN_STATS, "success"),    _btn(ADMIN_BROADCAST, "success")],
+        [_btn(ADMIN_ADD, "success"),      _btn(ADMIN_REMOVE, "danger")],
+        [_btn(ADMIN_LIST, "primary")],
+        [_btn(MENU_BACK, "primary")],
     ]
     return _kb(rows)
 
-def coin_select_kb(rates: list) -> str:
+def coin_select_inline(rates: list) -> str:
     rows = []
     for r in rates:
         name  = COIN_DISPLAY_NAMES.get(r["coin_type"], r["coin_type"])
         style = COIN_STYLES.get(r["coin_type"], "primary")
         rows.append([_ibtn(
-            f"{name} ({r['rate_per_thousand']} টাকা/হাজার)",
+            f"{name} ({fmt_money(r['rate_per_thousand'])} টাকা/হাজার)",
             style=style,
-            callback_data=f"select_coin:{r['coin_type']}",
+            callback_data=f"sel_coin:{r['coin_type']}",
         )])
     return _inline_kb(rows)
 
-def copy_username_kb(username: str) -> str:
+def username_copy_inline(username: str) -> str:
     return _inline_kb([[
         _ibtn(username, style="success", copy_text={"text": username})
     ]])
 
-def order_action_kb(order_id: int) -> str:
+def order_action_inline(order_id: int) -> str:
     return _inline_kb([[
-        _ibtn("✅ Approve", style="success", callback_data=f"order_approve:{order_id}"),
-        _ibtn("❌ Reject",  style="danger",  callback_data=f"order_reject:{order_id}"),
+        _ibtn("✅ Approve", style="success", callback_data=f"approve:{order_id}"),
+        _ibtn("❌ Reject",  style="danger",  callback_data=f"reject:{order_id}"),
     ]])
 
-def rate_select_kb(rates: list) -> str:
+def coin_rate_edit_inline(rates: list) -> str:
     rows = []
     for r in rates:
+        name  = COIN_DISPLAY_NAMES.get(r["coin_type"], r["coin_type"])
+        style = COIN_STYLES.get(r["coin_type"], "primary")
         rows.append([_ibtn(
-            f"{r['display_name']} — বর্তমান রেট: {r['rate_per_thousand']}",
-            style="primary",
-            callback_data=f"set_rate:{r['coin_type']}",
+            f"✏️ {name}  —  {fmt_money(r['rate_per_thousand'])} টাকা/হাজার",
+            style=style,
+            callback_data=f"edit_rate:{r['coin_type']}",
         )])
     return _inline_kb(rows)
 
-def username_select_kb(rates: list) -> str:
+def coin_username_edit_inline(rates: list) -> str:
     rows = []
     for r in rates:
+        name  = COIN_DISPLAY_NAMES.get(r["coin_type"], r["coin_type"])
+        style = COIN_STYLES.get(r["coin_type"], "primary")
+        un    = r["receiving_username"] or "(সেট করা নেই)"
         rows.append([_ibtn(
-            f"{r['display_name']} — বর্তমান ইউজারনেম: {r['receiving_username']}",
-            style="primary",
-            callback_data=f"set_username:{r['coin_type']}",
+            f"✏️ {name}  —  {un}",
+            style=style,
+            callback_data=f"edit_un:{r['coin_type']}",
         )])
     return _inline_kb(rows)
-
-# ─────────────────────────────────────────────
-# DB query helpers
-# ─────────────────────────────────────────────
-
-def get_rates():
-    return db_fetchall("SELECT * FROM coin_rates ORDER BY coin_type")
-
-def get_settings():
-    return db_fetchone("SELECT * FROM bot_settings LIMIT 1")
-
-def get_rate_for_coin(coin_type):
-    return db_fetchone("SELECT * FROM coin_rates WHERE coin_type = %s", (coin_type,))
 
 # ─────────────────────────────────────────────
 # Notify admins
 # ─────────────────────────────────────────────
 
-def notify_admins(order):
-    caption = (
-        f"🆕 নতুন অর্ডার #{order['id']}\n"
-        f"👤 {order['telegram_first_name'] or 'Unknown'}"
-        + (f" (@{order['telegram_username']})" if order["telegram_username"] else "")
-        + f"\n🪙 {COIN_DISPLAY_NAMES.get(order['coin_type'], order['coin_type'])}: "
-        + f"{fmt_num(order['quantity'])} coins\n"
-        + f"💰 {fmt_money(order['amount_bdt'])} BDT\n"
-        + f"📱 বিকাশ: {order['bkash_number']}"
-    )
-    kb = order_action_kb(order["id"])
-    for admin_id in get_admin_ids():
+def notify_admins(text: str, markup=None):
+    for aid in get_admin_ids():
         try:
-            if order["screenshot_file_id"]:
-                bot.send_photo(admin_id, order["screenshot_file_id"],
-                               caption=caption, reply_markup=kb)
-            else:
-                bot.send_message(admin_id, caption, reply_markup=kb)
+            bot.send_message(aid, text, reply_markup=markup)
         except Exception as e:
-            logger.error(f"Admin notify failed ({admin_id}): {e}")
+            logger.warning(f"Cannot notify admin {aid}: {e}")
+
+def notify_admins_photo(file_id: str, caption: str, markup=None):
+    for aid in get_admin_ids():
+        try:
+            bot.send_photo(aid, file_id, caption=caption, reply_markup=markup)
+        except Exception as e:
+            logger.warning(f"Cannot notify admin {aid}: {e}")
 
 # ─────────────────────────────────────────────
-# /start  /admin
+# /start  &  /cancel
 # ─────────────────────────────────────────────
 
 @bot.message_handler(commands=["start"])
 def cmd_start(msg):
     reset_state(msg.chat.id)
+    name  = msg.from_user.first_name or "বন্ধু"
+    admin = is_admin(msg.from_user.id)
     bot.send_message(
         msg.chat.id,
-        "👋 স্বাগতম! আপনি কী করতে চান নিচ থেকে বেছে নিন।",
+        f"স্বাগতম {name}! 👋\n\nকোন কয়েন সেল করবেন?",
+        reply_markup=main_menu_kb(admin),
+    )
+
+@bot.message_handler(commands=["cancel"])
+def cmd_cancel(msg):
+    state = get_state(msg.chat.id)
+    if state.get("step") == "idle":
+        bot.send_message(
+            msg.chat.id,
+            "কোনো চলমান প্রক্রিয়া নেই।",
+            reply_markup=main_menu_kb(is_admin(msg.from_user.id)),
+        )
+        return
+    reset_state(msg.chat.id)
+    bot.send_message(
+        msg.chat.id,
+        "❌ বাতিল করা হয়েছে। মেইন মেনুতে ফিরে গেলেন।",
         reply_markup=main_menu_kb(is_admin(msg.from_user.id)),
     )
 
-@bot.message_handler(commands=["admin"])
-def cmd_admin(msg):
-    if not is_admin(msg.from_user.id):
-        bot.send_message(msg.chat.id, "⛔ আপনার এই কমান্ড ব্যবহারের অনুমতি নেই।")
-        return
+# ─────────────────────────────────────────────
+# Main menu
+# ─────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == MENU_BACK)
+def menu_back(msg):
     reset_state(msg.chat.id)
-    bot.send_message(msg.chat.id,
-                     "🛠 এডমিন প্যানেল — একটি অপশন বাছাই করুন:",
-                     reply_markup=admin_menu_kb())
-
-# ─────────────────────────────────────────────
-# Photo handler
-# ─────────────────────────────────────────────
-
-@bot.message_handler(content_types=["photo"])
-def on_photo(msg):
-    state = get_state(msg.chat.id)
-    if state.get("step") == "await_screenshot":
-        state["screenshot_file_id"] = msg.photo[-1].file_id
-        state["step"] = "await_bkash"
-        bot.send_message(msg.chat.id,
-                         "✅ স্ক্রিনশট পাওয়া গেছে। আপনার বিকাশ নাম্বার লিখুন:")
-
-# ─────────────────────────────────────────────
-# Text handler
-# ─────────────────────────────────────────────
-
-@bot.message_handler(content_types=["text"])
-def on_text(msg):
-    chat_id = msg.chat.id
-    user_id = msg.from_user.id if msg.from_user else None
-    text    = (msg.text or "").strip()
-    admin   = is_admin(user_id)
-
-    try:
-        # ── Main menu ────────────────────────────────────────────
-        if text == MENU_SELL:
-            rates = get_rates()
-            if not rates:
-                bot.send_message(chat_id, "⚠️ এই মুহূর্তে কোনো কয়েনের রেট সেট করা নেই।")
-            else:
-                bot.send_message(chat_id, "🪙 কোন কয়েন সেল করতে চান?",
-                                 reply_markup=coin_select_kb(rates))
-            return
-
-        if text == MENU_RATE:
-            rates = get_rates()
-            if not rates:
-                bot.send_message(chat_id, "⚠️ এই মুহূর্তে কোনো রেট সেট করা নেই।")
-            else:
-                lines = "\n".join(
-                    f"🪙 {r['display_name']}: {r['rate_per_thousand']} টাকা / হাজার কয়েন"
-                    for r in rates
-                )
-                bot.send_message(chat_id, f"📊 আজকের রেট\n\n{lines}")
-            return
-
-        if text == MENU_ORDERS:
-            orders = db_fetchall(
-                "SELECT * FROM orders WHERE telegram_user_id = %s "
-                "ORDER BY created_at DESC LIMIT 10", (user_id,)
-            )
-            if not orders:
-                bot.send_message(chat_id, "📋 আপনার কোনো অর্ডার নেই।")
-            else:
-                lines = "\n".join(
-                    f"🗂 #{o['id']} — {fmt_num(o['quantity'])} "
-                    f"{COIN_DISPLAY_NAMES.get(o['coin_type'], o['coin_type'])} — "
-                    f"{fmt_money(o['amount_bdt'])} BDT — {status_label(o['status'])}"
-                    for o in orders
-                )
-                bot.send_message(chat_id, f"📋 আপনার সাম্প্রতিক অর্ডার\n\n{lines}")
-            return
-
-        if text == MENU_SUPPORT:
-            settings = get_settings()
-            contact = settings["support_contact"] if settings else "সেট করা নেই"
-            bot.send_message(chat_id, f"☎️ সাপোর্ট প্রয়োজন হলে যোগাযোগ করুন:\n{contact}")
-            return
-
-        if text == MENU_ADMIN:
-            if not admin:
-                bot.send_message(chat_id, "⛔ আপনার এই মেনু ব্যবহারের অনুমতি নেই।")
-            else:
-                reset_state(chat_id)
-                bot.send_message(chat_id,
-                                 "🛠 এডমিন প্যানেল — একটি অপশন বাছাই করুন:",
-                                 reply_markup=admin_menu_kb())
-            return
-
-        if text == MENU_BACK:
-            reset_state(chat_id)
-            bot.send_message(chat_id, "⬅️ মেইন মেনুতে ফিরে গেলেন।",
-                             reply_markup=main_menu_kb(admin))
-            return
-
-        # ── Admin menu ───────────────────────────────────────────
-        if admin:
-            if text == ADMIN_PENDING:
-                orders = db_fetchall(
-                    "SELECT * FROM orders WHERE status='pending' "
-                    "ORDER BY created_at DESC LIMIT 20"
-                )
-                if not orders:
-                    bot.send_message(chat_id, "✅ কোনো পেন্ডিং অর্ডার নেই।")
-                else:
-                    for o in orders:
-                        cap = (
-                            f"🗂 অর্ডার #{o['id']}\n"
-                            f"👤 {o['telegram_first_name'] or 'Unknown'}"
-                            + (f" (@{o['telegram_username']})" if o["telegram_username"] else "")
-                            + f"\n🪙 {COIN_DISPLAY_NAMES.get(o['coin_type'], o['coin_type'])}: "
-                            + f"{fmt_num(o['quantity'])} coins"
-                            + f"\n💰 {fmt_money(o['amount_bdt'])} BDT"
-                            + f"\n📱 বিকাশ: {o['bkash_number']}"
-                        )
-                        kb = order_action_kb(o["id"])
-                        if o["screenshot_file_id"]:
-                            bot.send_photo(chat_id, o["screenshot_file_id"],
-                                           caption=cap, reply_markup=kb)
-                        else:
-                            bot.send_message(chat_id, cap + "\n\n(কোনো স্ক্রিনশট নেই)",
-                                             reply_markup=kb)
-                return
-
-            if text == ADMIN_RATES:
-                bot.send_message(chat_id, "💱 কোন কয়েনের রেট পরিবর্তন করতে চান?",
-                                 reply_markup=rate_select_kb(get_rates()))
-                return
-
-            if text == ADMIN_USERNAME:
-                bot.send_message(chat_id, "🧑‍🦲 কোন কয়েনের ইউজারনেম পরিবর্তন করতে চান?",
-                                 reply_markup=username_select_kb(get_rates()))
-                return
-
-            if text == ADMIN_SUPPORT:
-                get_state(chat_id)["step"] = "admin_await_support"
-                bot.send_message(chat_id, "☎️ ইউজারদের জন্য সাপোর্ট কন্টাক্ট তথ্য লিখুন:")
-                return
-
-            if text == ADMIN_STATS:
-                totals = db_fetchone(
-                    "SELECT COUNT(*) AS total_orders, "
-                    "SUM(CASE WHEN status='approved' THEN amount_bdt::numeric ELSE 0 END) AS total_paid "
-                    "FROM orders"
-                )
-                status_rows = db_fetchall(
-                    "SELECT status, COUNT(*) AS cnt FROM orders GROUP BY status"
-                )
-                coin_rows = db_fetchall(
-                    "SELECT coin_type, SUM(quantity) AS qty FROM orders "
-                    "WHERE status='approved' GROUP BY coin_type"
-                )
-                counts = {r["status"]: r["cnt"] for r in status_rows}
-                coin_lines = "\n".join(
-                    f"🪙 {COIN_DISPLAY_NAMES.get(c['coin_type'], c['coin_type'])}: "
-                    f"{fmt_num(c['qty'] or 0)} coins"
-                    for c in coin_rows
-                ) or "কোনো এপ্রুভড অর্ডার নেই।"
-                bot.send_message(
-                    chat_id,
-                    f"📈 স্ট্যাটাস\n\n"
-                    f"📦 মোট অর্ডার: {fmt_num(totals['total_orders'] or 0)}\n"
-                    f"⏳ পেন্ডিং: {fmt_num(counts.get('pending', 0))}\n"
-                    f"✅ এপ্রুভড: {fmt_num(counts.get('approved', 0))}\n"
-                    f"❌ রিজেক্টেড: {fmt_num(counts.get('rejected', 0))}\n"
-                    f"💰 মোট পরিশোধিত: {fmt_money(totals['total_paid'] or 0)} BDT\n\n"
-                    f"{coin_lines}",
-                )
-                return
-
-            if text == ADMIN_ADD:
-                get_state(chat_id)["step"] = "admin_await_add_admin"
-                bot.send_message(
-                    chat_id,
-                    "➕ নতুন এডমিনের টেলিগ্রাম ইউজার আইডি (সংখ্যা) লিখুন।\n"
-                    "ℹ️ ইউজার আইডি জানতে তাকে বলুন @userinfobot কে মেসেজ পাঠাতে।",
-                )
-                return
-
-            if text == ADMIN_REMOVE:
-                ids = get_admin_ids()
-                id_list = "\n".join(str(i) for i in ids) if ids else "কোনো এডমিন নেই।"
-                get_state(chat_id)["step"] = "admin_await_remove_admin"
-                bot.send_message(
-                    chat_id,
-                    f"➖ কোন এডমিনকে রিমুভ করতে চান? আইডি লিখে পাঠান:\n\n{id_list}"
-                )
-                return
-
-            if text == ADMIN_LIST:
-                ids = get_admin_ids()
-                lines = "\n".join(
-                    f"👤 {uid}" + (" (মূল এডমিন)" if is_bootstrap_admin(uid) else "")
-                    for uid in ids
-                ) if ids else "কোনো এডমিন নেই।"
-                bot.send_message(chat_id, f"📋 এডমিন লিস্ট\n\n{lines}")
-                return
-
-        # ── Conversation steps ───────────────────────────────────
-        state = get_state(chat_id)
-        step  = state.get("step")
-
-        if step == "await_quantity":
-            _handle_quantity(chat_id, text, state)
-        elif step == "await_bkash":
-            _handle_bkash(chat_id, text, state, msg.from_user)
-        elif step == "admin_await_rate" and admin:
-            _handle_rate_input(chat_id, text, state)
-        elif step == "admin_await_coin_username" and admin:
-            _handle_username_input(chat_id, text, state)
-        elif step == "admin_await_support" and admin:
-            _handle_support_input(chat_id, text)
-        elif step == "admin_await_add_admin" and admin:
-            _handle_add_admin(chat_id, text, user_id)
-        elif step == "admin_await_remove_admin" and admin:
-            _handle_remove_admin(chat_id, text)
-
-    except Exception as e:
-        logger.exception(f"Error in chat {chat_id}: {e}")
-        try:
-            bot.send_message(chat_id, "⚠️ কিছু একটা সমস্যা হয়েছে। আবার চেষ্টা করুন।")
-        except Exception:
-            pass
-
-# ─────────────────────────────────────────────
-# Conversation step handlers
-# ─────────────────────────────────────────────
-
-def _handle_quantity(chat_id, text, state):
-    cleaned = text.replace(",", "").replace(" ", "")
-    try:
-        quantity = int(cleaned)
-        if quantity <= 0:
-            raise ValueError
-    except ValueError:
-        bot.send_message(chat_id, "⚠️ সঠিক সংখ্যা লিখুন (যেমন: 100000)।")
-        return
-
-    coin_type = state.get("coin_type")
-    rate      = state.get("rate_per_thousand", 0)
-    amount    = (quantity / 1000) * rate
-
-    rate_row = get_rate_for_coin(coin_type) if coin_type else None
-    username = rate_row["receiving_username"] if rate_row else "সেট করা নেই"
-
-    state["quantity"]   = quantity
-    state["amount_bdt"] = amount
-    state["step"]       = "await_screenshot"
-
     bot.send_message(
-        chat_id,
-        f"🔘 পরিমাণ: {fmt_num(quantity)} {COIN_DISPLAY_NAMES.get(coin_type, coin_type)}\n"
-        f"💵 পাবেন: {fmt_money(amount)} BDT\n\n"
-        f"👇 নিচের বাটনে ক্লিক করে ইউজারনেম কপি করুন, তারপর কয়েন সেন্ড করুন:\n\n"
-        f"📤 কয়েন পাঠানোর পর স্ক্রিনশট আপলোড করুন:",
-        reply_markup=copy_username_kb(username),
+        msg.chat.id,
+        "মেইন মেনুতে ফিরে গেলেন!",
+        reply_markup=main_menu_kb(is_admin(msg.from_user.id)),
     )
 
-
-def _handle_bkash(chat_id, text, state, from_user):
-    bkash = text.strip()
-    if not re.match(r"^01[0-9]{9}$", bkash):
-        bot.send_message(chat_id, "⚠️ সঠিক বিকাশ নাম্বার লিখুন (যেমন: 01712345678)।")
+@bot.message_handler(func=lambda m: m.text == MENU_RATE)
+def menu_rate(msg):
+    rates = db_fetchall("SELECT * FROM coin_rates ORDER BY coin_type")
+    if not rates:
+        bot.send_message(msg.chat.id, "কোনো রেট পাওয়া যায়নি।")
         return
+    lines = ["📊 আজকের কয়েন রেট:\n"]
+    for r in rates:
+        name = COIN_DISPLAY_NAMES.get(r["coin_type"], r["coin_type"])
+        lines.append(f"🪙 {name}: {fmt_money(r['rate_per_thousand'])} টাকা/হাজার")
+    bot.send_message(msg.chat.id, "\n".join(lines))
 
-    coin_type  = state.get("coin_type")
-    quantity   = state.get("quantity")
-    amount_bdt = state.get("amount_bdt")
-    rate       = state.get("rate_per_thousand", 0)
-    screenshot = state.get("screenshot_file_id")
+@bot.message_handler(func=lambda m: m.text == MENU_SUPPORT)
+def menu_support(msg):
+    row = db_fetchone("SELECT support_contact FROM bot_settings LIMIT 1")
+    contact = (row["support_contact"] if row and row["support_contact"] else "এখনো সেট করা হয়নি।")
+    bot.send_message(msg.chat.id, f"☎️ সাপোর্ট যোগাযোগ:\n\n{contact}")
 
-    if not coin_type or not quantity or amount_bdt is None:
-        bot.send_message(chat_id, "⚠️ কিছু ভুল হয়েছে। আবার শুরু করুন।")
-        reset_state(chat_id)
-        return
-
-    order = db_execute_returning(
-        """
-        INSERT INTO orders
-          (telegram_user_id, telegram_username, telegram_first_name,
-           coin_type, quantity, rate_per_thousand, amount_bdt,
-           bkash_number, screenshot_file_id, status)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending') RETURNING *
-        """,
-        (
-            from_user.id,
-            getattr(from_user, "username", None),
-            getattr(from_user, "first_name", None),
-            coin_type, quantity, str(rate), str(amount_bdt),
-            bkash, screenshot,
-        ),
+@bot.message_handler(func=lambda m: m.text == MENU_ORDERS)
+def menu_orders(msg):
+    orders = db_fetchall(
+        "SELECT * FROM orders WHERE telegram_user_id=%s ORDER BY created_at DESC LIMIT 10",
+        (msg.from_user.id,),
     )
-
-    reset_state(chat_id)
-
-    if not order:
-        bot.send_message(chat_id, "⚠️ অর্ডার তৈরি করতে সমস্যা হয়েছে।")
+    if not orders:
+        bot.send_message(msg.chat.id, "আপনার কোনো অর্ডার নেই।")
         return
+    lines = ["📋 আপনার শেষ ১০টি অর্ডার:\n"]
+    for o in orders:
+        name = COIN_DISPLAY_NAMES.get(o["coin_type"], o["coin_type"])
+        date, time_ = fmt_dhaka(o["created_at"])
+        lines.append(
+            f"🔹 অর্ডার #{o['id']}\n"
+            f"   🪙 {name} — {fmt_num(o['quantity'])} কয়েন\n"
+            f"   💵 {fmt_money(o['amount_bdt'])} BDT\n"
+            f"   📌 {status_label(o['status'])}\n"
+            f"   🕐 {date} {time_}\n"
+        )
+    bot.send_message(msg.chat.id, "\n".join(lines))
 
-    date_str, time_str = fmt_dhaka(order["created_at"])
+# ─────────────────────────────────────────────
+# Sell flow — Step 1: Show coin list
+# ─────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == MENU_SELL)
+def menu_sell(msg):
+    reset_state(msg.chat.id)
+    rates = db_fetchall("SELECT * FROM coin_rates ORDER BY coin_type")
+    if not rates:
+        bot.send_message(msg.chat.id, "এই মুহূর্তে কোনো কয়েন পাওয়া যাচ্ছে না।")
+        return
+    get_state(msg.chat.id)["step"] = "select_coin"
     bot.send_message(
-        chat_id,
-        f"⏳ রিকোয়েস্ট সফলভাবে সাবমিট হয়েছে!\n\n"
-        f"🧾 পেমেন্ট রিসিট\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🗂 অর্ডার আইডি: #{order['id']}\n"
-        f"🪙 টোটাল কয়েন: {fmt_num(order['quantity'])} Coins\n"
-        f"💰 প্রাপ্য অ্যামাউন্ট: {fmt_money(order['amount_bdt'])} BDT\n"
-        f"📱 বিকাশ অ্যাকাউন্ট: {order['bkash_number']}\n"
-        f"📅 তারিখ: {date_str} ({time_str})\n"
-        f"⏱ অবস্তা: {status_label(order['status'])}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"✨ এডমিন ভেরিফাই করে কিছুক্ষণের মধ্যে টাকা পাঠিয়ে দেবে।",
-    )
-    notify_admins(order)
-
-
-def _handle_rate_input(chat_id, text, state):
-    try:
-        rate = float(text.replace(",", "").replace(" ", ""))
-        if rate <= 0:
-            raise ValueError
-    except ValueError:
-        bot.send_message(chat_id, "⚠️ সঠিক সংখ্যা লিখুন (যেমন: 800)।")
-        return
-
-    coin_type = state.get("pending_rate_coin_type")
-    if not coin_type:
-        bot.send_message(chat_id, "⚠️ কিছু ভুল হয়েছে। আবার শুরু করুন।")
-        reset_state(chat_id)
-        return
-
-    db_execute("UPDATE coin_rates SET rate_per_thousand = %s WHERE coin_type = %s",
-               (str(rate), coin_type))
-    reset_state(chat_id)
-    bot.send_message(
-        chat_id,
-        f"✅ {COIN_DISPLAY_NAMES.get(coin_type, coin_type)} এর রেট "
-        f"{rate} টাকা/হাজার কয়েনে সেট করা হয়েছে।",
-        reply_markup=admin_menu_kb(),
+        msg.chat.id,
+        "কোন কয়েন সেল করতে চান?",
+        reply_markup=coin_select_inline(rates),
     )
 
+# ─────────────────────────────────────────────
+# Sell flow — Step 2: Coin selected → ask quantity
+# ─────────────────────────────────────────────
 
-def _handle_username_input(chat_id, text, state):
-    username = text.strip().lstrip("@")
-    if not username:
-        bot.send_message(chat_id, "⚠️ একটি সঠিক ইউজারনেম লিখুন।")
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("sel_coin:"))
+def cb_select_coin(call):
+    coin_type = call.data.split(":", 1)[1]
+    if coin_type not in COIN_TYPES:
+        bot.answer_callback_query(call.id, "অবৈধ কয়েন।")
         return
-    coin_type = state.get("pending_username_coin_type")
-    if not coin_type:
-        bot.send_message(chat_id, "⚠️ কিছু ভুল হয়েছে। আবার শুরু করুন।")
-        reset_state(chat_id)
+    rate_row = db_fetchone("SELECT * FROM coin_rates WHERE coin_type=%s", (coin_type,))
+    if not rate_row:
+        bot.answer_callback_query(call.id, "রেট পাওয়া যায়নি।")
         return
-    db_execute("UPDATE coin_rates SET receiving_username = %s WHERE coin_type = %s",
-               (username, coin_type))
-    reset_state(chat_id)
-    bot.send_message(
-        chat_id,
-        f"✅ {COIN_DISPLAY_NAMES.get(coin_type, coin_type)} এর ইউজারনেম "
-        f"{username} সেট করা হয়েছে।",
-        reply_markup=admin_menu_kb(),
-    )
 
+    bot.answer_callback_query(call.id)
 
-def _handle_support_input(chat_id, text):
-    contact = text.strip()
-    if not contact:
-        bot.send_message(chat_id, "⚠️ সঠিক তথ্য লিখুন।")
-        return
-    existing = get_settings()
-    if existing:
-        db_execute("UPDATE bot_settings SET support_contact = %s WHERE id = %s",
-                   (contact, existing["id"]))
-    else:
-        db_execute("INSERT INTO bot_settings (support_contact) VALUES (%s)", (contact,))
-    reset_state(chat_id)
-    bot.send_message(chat_id, "✅ সাপোর্ট কন্টাক্ট সেট করা হয়েছে।",
-                     reply_markup=admin_menu_kb())
-
-
-def _handle_add_admin(chat_id, text, from_id):
+    # Delete the coin selection message
     try:
-        new_id = int(text.strip())
-        if new_id <= 0:
-            raise ValueError
-    except ValueError:
-        bot.send_message(chat_id, "⚠️ সঠিক টেলিগ্রাম ইউজার আইডি (শুধু সংখ্যা) লিখুন।")
-        return
-    add_admin(new_id, from_id)
-    reset_state(chat_id)
-    bot.send_message(chat_id,
-                     f"✅ ইউজার আইডি {new_id} কে এডমিন হিসেবে যুক্ত করা হয়েছে।",
-                     reply_markup=admin_menu_kb())
-    try:
-        bot.send_message(new_id,
-                         "🎉 আপনাকে এই বটের এডমিন হিসেবে যুক্ত করা হয়েছে। "
-                         "/admin লিখে দেখুন।")
+        bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
         pass
 
+    state = get_state(call.message.chat.id)
+    state["step"]      = "enter_qty"
+    state["coin_type"] = coin_type
+    state["rate"]      = float(rate_row["rate_per_thousand"])
+    state["un"]        = rate_row["receiving_username"] or ""
 
-def _handle_remove_admin(chat_id, text):
-    try:
-        target_id = int(text.strip())
-    except ValueError:
-        bot.send_message(chat_id, "⚠️ সঠিক টেলিগ্রাম ইউজার আইডি লিখুন।")
+    name = COIN_DISPLAY_NAMES.get(coin_type, coin_type)
+    bot.send_message(
+        call.message.chat.id,
+        f"🪙 {name}\n"
+        f"📊 রেট: {fmt_money(rate_row['rate_per_thousand'])} টাকা প্রতি হাজার কয়েন\n\n"
+        f"👉 আপনি কত কয়েন সেল করতে চান? সংখ্যা লিখে পাঠান:\n"
+        f"(সর্বনিম্ন {fmt_num(MIN_COIN_QTY)} কয়েন)",
+    )
+
+# ─────────────────────────────────────────────
+# Sell flow — Step 3: Quantity → show amount + ask screenshot
+# ─────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: get_state(m.chat.id).get("step") == "enter_qty")
+def step_qty(msg):
+    text = msg.text.strip().replace(",", "").replace(" ", "")
+    if not text.isdigit() or int(text) <= 0:
+        bot.send_message(msg.chat.id, "সঠিক সংখ্যা লিখুন (যেমন: 10000):")
         return
-    if is_bootstrap_admin(target_id):
+
+    qty = int(text)
+
+    if qty < MIN_COIN_QTY:
         bot.send_message(
-            chat_id,
-            "⚠️ এই আইডিটি সিস্টেমের মূল এডমিন (ENV এ সেট করা), এটি রিমুভ করা যাবে না।",
+            msg.chat.id,
+            f"❌ সর্বনিম্ন {fmt_num(MIN_COIN_QTY)} কয়েন সেল করতে হবে।\n\n"
+            f"আবার সংখ্যা লিখুন:",
         )
-        reset_state(chat_id)
         return
-    remove_admin(target_id)
-    reset_state(chat_id)
-    bot.send_message(chat_id,
-                     f"✅ ইউজার আইডি {target_id} কে এডমিন তালিকা থেকে রিমুভ করা হয়েছে।",
-                     reply_markup=admin_menu_kb())
+
+    state  = get_state(msg.chat.id)
+    rate   = state["rate"]
+    amount = (qty / 1000) * rate
+    state["qty"]    = qty
+    state["amount"] = amount
+    state["step"]   = "upload_ss"
+
+    coin_type = state["coin_type"]
+    name = COIN_DISPLAY_NAMES.get(coin_type, coin_type)
+    un   = state["un"]
+
+    body = (
+        f"📦 পরিমাণ: {fmt_num(qty)} {name}\n"
+        f"💵 পাবেন: {fmt_money(amount)} BDT\n"
+    )
+
+    if un:
+        body += (
+            f"\n👆 নিচের বাটনে ক্লিক করে ইউজারনেম কপি করুন, তারপর কয়েন সেন্ড করুন:\n"
+            f"\n📸 কয়েন পাঠানোর পর স্ক্রিনশট আপলোড করুন:"
+        )
+        bot.send_message(msg.chat.id, body, reply_markup=username_copy_inline(un))
+    else:
+        body += "\n📸 কয়েন পাঠানোর পর স্ক্রিনশট আপলোড করুন:"
+        bot.send_message(msg.chat.id, body)
 
 # ─────────────────────────────────────────────
-# Callback query handler
+# Sell flow — Step 4: Screenshot → ask bkash number
 # ─────────────────────────────────────────────
 
-@bot.callback_query_handler(func=lambda c: True)
-def on_callback(call):
-    chat_id = call.message.chat.id
-    data    = call.data or ""
-    user_id = call.from_user.id
+@bot.message_handler(
+    content_types=["photo"],
+    func=lambda m: get_state(m.chat.id).get("step") == "upload_ss",
+)
+def step_screenshot(msg):
+    state = get_state(msg.chat.id)
+    state["ss_file_id"] = msg.photo[-1].file_id
+    state["step"]       = "enter_bkash"
+    bot.send_message(
+        msg.chat.id,
+        "✅ স্ক্রিনশট পেয়েছি!\n\n"
+        "📱 এখন আপনার bKash নম্বর লিখুন (যেখানে টাকা পাঠাবো):",
+    )
 
+# ─────────────────────────────────────────────
+# Sell flow — Step 5: bkash → confirm order
+# ─────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: get_state(m.chat.id).get("step") == "enter_bkash")
+def step_bkash(msg):
+    bkash = msg.text.strip()
+    if not re.match(r"^01[3-9]\d{8}$", bkash):
+        bot.send_message(
+            msg.chat.id,
+            "❌ সঠিক bKash নম্বর দিন।\nযেমন: 01XXXXXXXXX (১১ সংখ্যা):",
+        )
+        return
+
+    state      = get_state(msg.chat.id)
+    coin_type  = state["coin_type"]
+    qty        = state["qty"]
+    amount     = state["amount"]
+    rate       = state["rate"]
+    ss_file_id = state["ss_file_id"]
+
+    row = db_execute_returning(
+        """
+        INSERT INTO orders
+            (telegram_user_id, telegram_username, telegram_first_name,
+             coin_type, quantity, rate_per_thousand, amount_bdt,
+             bkash_number, screenshot_file_id, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
+        RETURNING id
+        """,
+        (
+            msg.from_user.id,
+            msg.from_user.username,
+            msg.from_user.first_name,
+            coin_type, qty, rate, amount, bkash, ss_file_id,
+        ),
+    )
+    order_id = row["id"]
+    reset_state(msg.chat.id)
+
+    name  = COIN_DISPLAY_NAMES.get(coin_type, coin_type)
+    uname = f"@{msg.from_user.username}" if msg.from_user.username else str(msg.from_user.id)
+
+    caption = (
+        f"🆕 নতুন অর্ডার #{order_id}\n"
+        f"👤 ইউজার: {msg.from_user.first_name} ({uname})\n"
+        f"🪙 কয়েন: {name}\n"
+        f"📦 পরিমাণ: {fmt_num(qty)}\n"
+        f"💵 টাকা: {fmt_money(amount)} BDT\n"
+        f"📱 bKash: {bkash}"
+    )
+    notify_admins_photo(ss_file_id, caption, markup=order_action_inline(order_id))
+
+    bot.send_message(
+        msg.chat.id,
+        f"🎉 অর্ডার সফলভাবে জমা হয়েছে!\n\n"
+        f"🔖 অর্ডার নম্বর: #{order_id}\n"
+        f"🪙 কয়েন: {name}\n"
+        f"📦 পরিমাণ: {fmt_num(qty)}\n"
+        f"💵 পাবেন: {fmt_money(amount)} BDT\n"
+        f"📱 bKash: {bkash}\n\n"
+        f"শীঘ্রই প্রক্রিয়া করা হবে। ধন্যবাদ! 🙏",
+        reply_markup=main_menu_kb(is_admin(msg.from_user.id)),
+    )
+
+# ─────────────────────────────────────────────
+# Admin panel
+# ─────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == MENU_ADMIN)
+def menu_admin(msg):
+    if not is_admin(msg.from_user.id):
+        bot.send_message(msg.chat.id, "❌ আপনার অ্যাক্সেস নেই।")
+        return
+    reset_state(msg.chat.id)
+    bot.send_message(msg.chat.id, "🛠 এডমিন প্যানেলে স্বাগতম!", reply_markup=admin_menu_kb())
+
+# ── Pending orders ──────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == ADMIN_PENDING and is_admin(m.from_user.id))
+def admin_pending(msg):
+    orders = db_fetchall("SELECT * FROM orders WHERE status='pending' ORDER BY created_at ASC")
+    if not orders:
+        bot.send_message(msg.chat.id, "কোনো পেন্ডিং অর্ডার নেই। ✅")
+        return
+    bot.send_message(msg.chat.id, f"📥 মোট পেন্ডিং অর্ডার: {len(orders)}")
+    for o in orders:
+        name  = COIN_DISPLAY_NAMES.get(o["coin_type"], o["coin_type"])
+        uname = f"@{o['telegram_username']}" if o["telegram_username"] else str(o["telegram_user_id"])
+        date, time_ = fmt_dhaka(o["created_at"])
+        caption = (
+            f"📋 অর্ডার #{o['id']}\n"
+            f"👤 ইউজার: {o['telegram_first_name']} ({uname})\n"
+            f"🪙 কয়েন: {name}\n"
+            f"📦 পরিমাণ: {fmt_num(o['quantity'])}\n"
+            f"💵 টাকা: {fmt_money(o['amount_bdt'])} BDT\n"
+            f"📱 bKash: {o['bkash_number']}\n"
+            f"🕐 {date} {time_}"
+        )
+        if o["screenshot_file_id"]:
+            bot.send_photo(msg.chat.id, o["screenshot_file_id"], caption=caption,
+                           reply_markup=order_action_inline(o["id"]))
+        else:
+            bot.send_message(msg.chat.id, caption, reply_markup=order_action_inline(o["id"]))
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("approve:"))
+def cb_approve(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "আপনার অ্যাক্সেস নেই।")
+        return
+    order_id = int(call.data.split(":")[1])
+    order = db_fetchone("SELECT * FROM orders WHERE id=%s", (order_id,))
+    if not order:
+        bot.answer_callback_query(call.id, "অর্ডার পাওয়া যায়নি।")
+        return
+    if order["status"] != "pending":
+        bot.answer_callback_query(call.id, f"অর্ডার ইতিমধ্যে {order['status']}.")
+        return
+    db_execute("UPDATE orders SET status='approved' WHERE id=%s", (order_id,))
+    bot.answer_callback_query(call.id, f"✅ অর্ডার #{order_id} অনুমোদিত।")
     try:
-        # ── Coin selection ───────────────────────────────────────
-        if data.startswith("select_coin:"):
-            coin_type = data.split(":", 1)[1]
-            bot.answer_callback_query(call.id)
-            try:
-                bot.delete_message(chat_id, call.message.message_id)
-            except Exception:
-                pass
-            rate_row = get_rate_for_coin(coin_type)
-            if not rate_row:
-                bot.send_message(chat_id, "⚠️ এই কয়েনের রেট পাওয়া যায়নি।")
-                return
-            state = get_state(chat_id)
-            state["step"]              = "await_quantity"
-            state["coin_type"]         = coin_type
-            state["rate_per_thousand"] = float(rate_row["rate_per_thousand"])
-            bot.send_message(
-                chat_id,
-                f"🪙 {COIN_DISPLAY_NAMES.get(coin_type, coin_type)}\n"
-                f"💵 রেট: {rate_row['rate_per_thousand']} টাকা প্রতি হাজার কয়েনে\n\n"
-                f"👉 আপনি কত কয়েন সেল করতে চান? সংখ্যা লিখে পাঠান:",
-            )
-            return
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+    name = COIN_DISPLAY_NAMES.get(order["coin_type"], order["coin_type"])
+    try:
+        bot.send_message(
+            order["telegram_user_id"],
+            f"✅ আপনার অর্ডার অনুমোদিত হয়েছে!\n\n"
+            f"🔖 অর্ডার: #{order_id}\n"
+            f"🪙 {name} — {fmt_num(order['quantity'])} কয়েন\n"
+            f"💵 {fmt_money(order['amount_bdt'])} BDT আপনার bKash-এ পাঠানো হয়েছে।\n\n"
+            f"ধন্যবাদ! 🙏",
+        )
+    except Exception:
+        pass
 
-        # ── Order approve / reject ───────────────────────────────
-        if data.startswith("order_approve:") or data.startswith("order_reject:"):
-            if not is_admin(user_id):
-                bot.answer_callback_query(call.id, "অনুমতি নেই।")
-                return
-            action, order_id_str = data.split(":", 1)
-            order_id = int(order_id_str)
-            approve  = action == "order_approve"
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("reject:"))
+def cb_reject(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "আপনার অ্যাক্সেস নেই।")
+        return
+    order_id = int(call.data.split(":")[1])
+    order = db_fetchone("SELECT * FROM orders WHERE id=%s", (order_id,))
+    if not order:
+        bot.answer_callback_query(call.id, "অর্ডার পাওয়া যায়নি।")
+        return
+    if order["status"] != "pending":
+        bot.answer_callback_query(call.id, f"অর্ডার ইতিমধ্যে {order['status']}.")
+        return
+    db_execute("UPDATE orders SET status='rejected' WHERE id=%s", (order_id,))
+    bot.answer_callback_query(call.id, f"❌ অর্ডার #{order_id} বাতিল।")
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+    name = COIN_DISPLAY_NAMES.get(order["coin_type"], order["coin_type"])
+    try:
+        bot.send_message(
+            order["telegram_user_id"],
+            f"❌ আপনার অর্ডার বাতিল হয়েছে।\n\n"
+            f"🔖 অর্ডার: #{order_id}\n"
+            f"🪙 {name} — {fmt_num(order['quantity'])} কয়েন\n\n"
+            f"সমস্যা হলে সাপোর্টে যোগাযোগ করুন।",
+        )
+    except Exception:
+        pass
 
-            order = db_fetchone("SELECT * FROM orders WHERE id = %s", (order_id,))
-            if not order:
-                bot.answer_callback_query(call.id, "অর্ডার পাওয়া যায়নি।")
-                return
-            if order["status"] != "pending":
-                bot.answer_callback_query(
-                    call.id,
-                    f"এই অর্ডার আগেই {status_label(order['status'])} করা হয়েছে।"
-                )
-                return
+# ── Rate edit ───────────────────────────────
 
-            new_status = "approved" if approve else "rejected"
-            db_execute("UPDATE orders SET status = %s WHERE id = %s",
-                       (new_status, order_id))
-            bot.answer_callback_query(
-                call.id,
-                "✅ এপ্রুভ করা হয়েছে।" if approve else "❌ রিজেক্ট করা হয়েছে।",
-            )
-            status_text = (
-                f"✅ অর্ডার #{order_id} এপ্রুভ করা হয়েছে।" if approve
-                else f"❌ অর্ডার #{order_id} রিজেক্ট করা হয়েছে।"
-            )
-            try:
-                if call.message.photo:
-                    bot.edit_message_caption(
-                        f"{call.message.caption or ''}\n\n{status_text}",
-                        chat_id=chat_id, message_id=call.message.message_id,
-                    )
-                elif call.message.text:
-                    bot.edit_message_text(
-                        f"{call.message.text}\n\n{status_text}",
-                        chat_id=chat_id, message_id=call.message.message_id,
-                    )
-            except Exception:
-                pass
-            try:
-                msg_user = (
-                    f"✅ আপনার অর্ডার #{order_id} এপ্রুভ হয়েছে! টাকা পাঠানো হয়েছে।"
-                    if approve
-                    else f"❌ আপনার অর্ডার #{order_id} বাতিল করা হয়েছে। সাপোর্টে যোগাযোগ করুন।"
-                )
-                bot.send_message(order["telegram_user_id"], msg_user)
-            except Exception:
-                pass
-            return
+@bot.message_handler(func=lambda m: m.text == ADMIN_RATES and is_admin(m.from_user.id))
+def admin_rates(msg):
+    rates = db_fetchall("SELECT * FROM coin_rates ORDER BY coin_type")
+    bot.send_message(
+        msg.chat.id,
+        "কোন কয়েনের রেট পরিবর্তন করবেন?",
+        reply_markup=coin_rate_edit_inline(rates),
+    )
 
-        # ── Rate coin selection ──────────────────────────────────
-        if data.startswith("set_rate:"):
-            if not is_admin(user_id):
-                bot.answer_callback_query(call.id, "অনুমতি নেই।")
-                return
-            coin_type = data.split(":", 1)[1]
-            bot.answer_callback_query(call.id)
-            state = get_state(chat_id)
-            state["step"]                   = "admin_await_rate"
-            state["pending_rate_coin_type"] = coin_type
-            bot.send_message(
-                chat_id,
-                f"💱 {COIN_DISPLAY_NAMES.get(coin_type, coin_type)} এর নতুন রেট লিখুন "
-                f"(প্রতি হাজার কয়েনে কত টাকা):",
-            )
-            return
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("edit_rate:"))
+def cb_edit_rate(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "আপনার অ্যাক্সেস নেই।")
+        return
+    coin_type = call.data.split(":")[1]
+    state = get_state(call.message.chat.id)
+    state["step"]      = "admin_rate"
+    state["edit_coin"] = coin_type
+    bot.answer_callback_query(call.id)
+    name = COIN_DISPLAY_NAMES.get(coin_type, coin_type)
+    bot.send_message(call.message.chat.id, f"✏️ {name} এর নতুন রেট লিখুন (টাকা/হাজার):")
 
-        # ── Username coin selection ──────────────────────────────
-        if data.startswith("set_username:"):
-            if not is_admin(user_id):
-                bot.answer_callback_query(call.id, "অনুমতি নেই।")
-                return
-            coin_type = data.split(":", 1)[1]
-            bot.answer_callback_query(call.id)
-            state = get_state(chat_id)
-            state["step"]                       = "admin_await_coin_username"
-            state["pending_username_coin_type"] = coin_type
-            bot.send_message(
-                chat_id,
-                f"🧑‍🦲 {COIN_DISPLAY_NAMES.get(coin_type, coin_type)} এর নতুন ইউজারনেম লিখুন "
-                f"(@ ছাড়া বা সহ):",
-            )
-            return
+@bot.message_handler(func=lambda m: get_state(m.chat.id).get("step") == "admin_rate")
+def step_admin_rate(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    text = msg.text.strip().replace(",", "")
+    try:
+        new_rate = float(text)
+        if new_rate <= 0:
+            raise ValueError
+    except ValueError:
+        bot.send_message(msg.chat.id, "সঠিক সংখ্যা লিখুন:")
+        return
+    state     = get_state(msg.chat.id)
+    coin_type = state["edit_coin"]
+    db_execute("UPDATE coin_rates SET rate_per_thousand=%s WHERE coin_type=%s", (new_rate, coin_type))
+    reset_state(msg.chat.id)
+    name = COIN_DISPLAY_NAMES.get(coin_type, coin_type)
+    bot.send_message(
+        msg.chat.id,
+        f"✅ {name} এর রেট আপডেট: {fmt_money(new_rate)} টাকা/হাজার",
+        reply_markup=admin_menu_kb(),
+    )
 
-        bot.answer_callback_query(call.id)
+# ── Username edit ────────────────────────────
 
-    except Exception as e:
-        logger.exception(f"Callback error: {e}")
+@bot.message_handler(func=lambda m: m.text == ADMIN_USERNAME and is_admin(m.from_user.id))
+def admin_username(msg):
+    rates = db_fetchall("SELECT * FROM coin_rates ORDER BY coin_type")
+    bot.send_message(
+        msg.chat.id,
+        "কোন কয়েনের receiving ইউজারনেম সেট করবেন?",
+        reply_markup=coin_username_edit_inline(rates),
+    )
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("edit_un:"))
+def cb_edit_un(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "আপনার অ্যাক্সেস নেই।")
+        return
+    coin_type = call.data.split(":")[1]
+    state = get_state(call.message.chat.id)
+    state["step"]      = "admin_un"
+    state["edit_coin"] = coin_type
+    bot.answer_callback_query(call.id)
+    name = COIN_DISPLAY_NAMES.get(coin_type, coin_type)
+    bot.send_message(call.message.chat.id, f"✏️ {name} এর নতুন ইউজারনেম লিখুন:")
+
+@bot.message_handler(func=lambda m: get_state(m.chat.id).get("step") == "admin_un")
+def step_admin_un(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    username  = msg.text.strip()
+    state     = get_state(msg.chat.id)
+    coin_type = state["edit_coin"]
+    db_execute("UPDATE coin_rates SET receiving_username=%s WHERE coin_type=%s", (username, coin_type))
+    reset_state(msg.chat.id)
+    name = COIN_DISPLAY_NAMES.get(coin_type, coin_type)
+    bot.send_message(
+        msg.chat.id,
+        f"✅ {name} এর ইউজারনেম সেট: {username}",
+        reply_markup=admin_menu_kb(),
+    )
+
+# ── Support contact ──────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == ADMIN_SUPPORT and is_admin(m.from_user.id))
+def admin_support_set(msg):
+    get_state(msg.chat.id)["step"] = "admin_support"
+    bot.send_message(msg.chat.id, "☎️ নতুন সাপোর্ট কন্টাক্ট লিখুন:")
+
+@bot.message_handler(func=lambda m: get_state(m.chat.id).get("step") == "admin_support")
+def step_admin_support(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    contact  = msg.text.strip()
+    existing = db_fetchone("SELECT id FROM bot_settings LIMIT 1")
+    if existing:
+        db_execute("UPDATE bot_settings SET support_contact=%s WHERE id=%s", (contact, existing["id"]))
+    else:
+        db_execute("INSERT INTO bot_settings (support_contact) VALUES (%s)", (contact,))
+    reset_state(msg.chat.id)
+    bot.send_message(
+        msg.chat.id,
+        f"✅ সাপোর্ট কন্টাক্ট আপডেট:\n{contact}",
+        reply_markup=admin_menu_kb(),
+    )
+
+# ── Stats ────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == ADMIN_STATS and is_admin(m.from_user.id))
+def admin_stats(msg):
+    total     = db_fetchone("SELECT COUNT(*) AS c FROM orders")["c"]
+    pending   = db_fetchone("SELECT COUNT(*) AS c FROM orders WHERE status='pending'")["c"]
+    approved  = db_fetchone("SELECT COUNT(*) AS c FROM orders WHERE status='approved'")["c"]
+    rejected  = db_fetchone("SELECT COUNT(*) AS c FROM orders WHERE status='rejected'")["c"]
+    total_bdt = db_fetchone(
+        "SELECT COALESCE(SUM(amount_bdt),0) AS s FROM orders WHERE status='approved'"
+    )["s"]
+    users = db_fetchone("SELECT COUNT(DISTINCT telegram_user_id) AS c FROM orders")["c"]
+    bot.send_message(
+        msg.chat.id,
+        f"📈 স্ট্যাটিস্টিক্স:\n\n"
+        f"📦 মোট অর্ডার: {total}\n"
+        f"⏳ পেন্ডিং: {pending}\n"
+        f"✅ অনুমোদিত: {approved}\n"
+        f"❌ বাতিল: {rejected}\n"
+        f"💵 মোট পরিশোধ: {fmt_money(total_bdt)} BDT\n"
+        f"👥 মোট ইউজার: {users}",
+    )
+
+# ── Admin management ─────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == ADMIN_ADD and is_admin(m.from_user.id))
+def admin_add(msg):
+    if not is_bootstrap_admin(msg.from_user.id):
+        bot.send_message(msg.chat.id, "শুধুমাত্র সুপার এডমিন এটি করতে পারবে।")
+        return
+    get_state(msg.chat.id)["step"] = "admin_add_id"
+    bot.send_message(msg.chat.id, "নতুন এডমিনের Telegram User ID লিখুন:")
+
+@bot.message_handler(func=lambda m: get_state(m.chat.id).get("step") == "admin_add_id")
+def step_admin_add(msg):
+    if not is_bootstrap_admin(msg.from_user.id):
+        return
+    if not msg.text.strip().isdigit():
+        bot.send_message(msg.chat.id, "সঠিক User ID দিন (শুধু সংখ্যা):")
+        return
+    new_id = int(msg.text.strip())
+    add_admin(new_id, msg.from_user.id)
+    reset_state(msg.chat.id)
+    bot.send_message(
+        msg.chat.id,
+        f"✅ {new_id} কে এডমিন হিসেবে যুক্ত করা হয়েছে।",
+        reply_markup=admin_menu_kb(),
+    )
+
+@bot.message_handler(func=lambda m: m.text == ADMIN_REMOVE and is_admin(m.from_user.id))
+def admin_remove(msg):
+    if not is_bootstrap_admin(msg.from_user.id):
+        bot.send_message(msg.chat.id, "শুধুমাত্র সুপার এডমিন এটি করতে পারবে।")
+        return
+    get_state(msg.chat.id)["step"] = "admin_rm_id"
+    bot.send_message(msg.chat.id, "রিমুভ করতে চান কোন এডমিনের User ID লিখুন:")
+
+@bot.message_handler(func=lambda m: get_state(m.chat.id).get("step") == "admin_rm_id")
+def step_admin_rm(msg):
+    if not is_bootstrap_admin(msg.from_user.id):
+        return
+    if not msg.text.strip().isdigit():
+        bot.send_message(msg.chat.id, "সঠিক User ID দিন:")
+        return
+    rm_id = int(msg.text.strip())
+    if rm_id in BOOTSTRAP_ADMINS:
+        bot.send_message(msg.chat.id, "সুপার এডমিনকে রিমুভ করা যাবে না।")
+        return
+    remove_admin(rm_id)
+    reset_state(msg.chat.id)
+    bot.send_message(
+        msg.chat.id,
+        f"✅ {rm_id} কে এডমিন লিস্ট থেকে সরানো হয়েছে।",
+        reply_markup=admin_menu_kb(),
+    )
+
+@bot.message_handler(func=lambda m: m.text == ADMIN_LIST and is_admin(m.from_user.id))
+def admin_list(msg):
+    admins = db_fetchall("SELECT telegram_user_id, created_at FROM admins ORDER BY created_at")
+    lines  = ["📋 এডমিন লিস্ট:\n"]
+    for aid in BOOTSTRAP_ADMINS:
+        lines.append(f"⭐ {aid} (সুপার এডমিন)")
+    for a in admins:
+        if a["telegram_user_id"] not in BOOTSTRAP_ADMINS:
+            date, _ = fmt_dhaka(a["created_at"])
+            lines.append(f"• {a['telegram_user_id']} (যুক্ত: {date})")
+    bot.send_message(msg.chat.id, "\n".join(lines))
+
+# ── Broadcast ────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == ADMIN_BROADCAST and is_admin(m.from_user.id))
+def admin_broadcast(msg):
+    get_state(msg.chat.id)["step"] = "admin_broadcast"
+    users = db_fetchall("SELECT COUNT(DISTINCT telegram_user_id) AS c FROM orders")
+    count = users[0]["c"] if users else 0
+    bot.send_message(
+        msg.chat.id,
+        f"📢 ব্রডকাস্ট মেসেজ লিখুন:\n\n"
+        f"(মোট {count} জন ইউজার পাবে)\n\n"
+        f"বাতিল করতে /cancel লিখুন।",
+    )
+
+@bot.message_handler(func=lambda m: get_state(m.chat.id).get("step") == "admin_broadcast")
+def step_broadcast(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    text = msg.text.strip()
+    reset_state(msg.chat.id)
+
+    user_ids = db_fetchall("SELECT DISTINCT telegram_user_id FROM orders")
+    total    = len(user_ids)
+    success  = 0
+    failed   = 0
+
+    status_msg = bot.send_message(msg.chat.id, f"📤 পাঠানো হচ্ছে... (0/{total})")
+
+    for i, row in enumerate(user_ids, 1):
         try:
-            bot.answer_callback_query(call.id, "⚠️ কিছু সমস্যা হয়েছে।")
+            bot.send_message(row["telegram_user_id"], f"📢 বিজ্ঞপ্তি:\n\n{text}")
+            success += 1
         except Exception:
-            pass
+            failed += 1
+        # Update progress every 5 users
+        if i % 5 == 0 or i == total:
+            try:
+                bot.edit_message_text(
+                    f"📤 পাঠানো হচ্ছে... ({i}/{total})",
+                    msg.chat.id,
+                    status_msg.message_id,
+                )
+            except Exception:
+                pass
+
+    bot.edit_message_text(
+        f"✅ ব্রডকাস্ট সম্পন্ন!\n\n"
+        f"📨 সফল: {success}\n"
+        f"❌ ব্যর্থ: {failed}\n"
+        f"📊 মোট: {total}",
+        msg.chat.id,
+        status_msg.message_id,
+    )
+    bot.send_message(msg.chat.id, "এডমিন মেনু:", reply_markup=admin_menu_kb())
 
 # ─────────────────────────────────────────────
-# Entry point
+# Fallback
+# ─────────────────────────────────────────────
+
+@bot.message_handler(content_types=["photo"],
+                     func=lambda m: get_state(m.chat.id).get("step") != "upload_ss")
+def unexpected_photo(msg):
+    bot.send_message(
+        msg.chat.id,
+        "মেনু থেকে বেছে নিন:",
+        reply_markup=main_menu_kb(is_admin(msg.from_user.id)),
+    )
+
+@bot.message_handler(func=lambda m: True)
+def fallback(msg):
+    if get_state(msg.chat.id).get("step") == "idle":
+        bot.send_message(
+            msg.chat.id,
+            "মেনু থেকে বেছে নিন:",
+            reply_markup=main_menu_kb(is_admin(msg.from_user.id)),
+        )
+
+# ─────────────────────────────────────────────
+# Main
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    init_db()          # auto-create tables on first run
-    logger.info("Bot starting (polling)…")
-    bot.infinity_polling(timeout=60, long_polling_timeout=30)
+    init_db()
+    logger.info("Bot polling started...")
+    bot.infinity_polling(timeout=30, long_polling_timeout=20)
